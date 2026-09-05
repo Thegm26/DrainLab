@@ -1,6 +1,9 @@
 # DrainLab
 
-DrainLab is a maintenance-aware Kubernetes/OpenShift rescheduling benchmark. It compares multiple planning algorithms that decide how to evacuate workloads from nodes scheduled for maintenance while preserving availability and using cluster capacity efficiently.
+DrainLab is a maintenance-aware Kubernetes rescheduling benchmark with planned,
+later validation against OpenShift. It compares multiple planning algorithms
+that decide how to evacuate workloads from nodes scheduled for maintenance
+while preserving availability and using cluster capacity efficiently.
 
 The project is designed as an offline, explainable planning and experimentation tool. It will use [KWOK](https://kwok.sigs.k8s.io/) to create reproducible simulated clusters without requiring a large physical Kubernetes or OpenShift environment.
 
@@ -15,6 +18,32 @@ DrainLab asks a broader question:
 > Given a set of nodes that must become unavailable before a deadline, what sequence of workload movements will complete the maintenance safely with the least disruption and additional capacity?
 
 A useful plan must account for more than whether each pod eventually fits. It must also respect availability during every step, wait for replacements when necessary, limit concurrent evictions, and explain when the maintenance request is infeasible.
+
+## Contribution and differentiation
+
+DrainLab does not introduce Kubernetes draining, rescheduling, or
+constraint-based placement. Its intended contribution is a reproducible
+benchmark for **planned multi-node maintenance** that evaluates placement and
+execution together.
+
+Under identical scenarios, DrainLab will compare several planning strategies
+and measure whether each one can:
+
+- find a feasible target placement before maintenance begins;
+- produce an ordered sequence of replacement, readiness, and eviction actions;
+- preserve declared availability constraints at every intermediate step;
+- identify the additional capacity required to complete maintenance;
+- meet a maintenance deadline; and
+- explain why a request is infeasible instead of failing partway through a
+  drain.
+
+The goal is controlled comparison and evidence, not another implementation of
+`kubectl drain`. The primary research question is:
+
+> Does jointly optimizing target placement and disruption-safe action ordering
+> reduce additional capacity and failed maintenance operations compared with
+> sequential drain and existing heuristics during planned multi-node
+> maintenance?
 
 ## Goals
 
@@ -40,12 +69,29 @@ Every planner will implement the same interface and receive the same immutable c
 
 | Planner | Role | Expected trade-off |
 | --- | --- | --- |
-| Native drain simulation | Operational baseline using sequential cordon/drain behavior and normal scheduling | Representative behavior, limited global look-ahead |
+| Sequential drain simulation | Operational baseline using one-node-at-a-time cordon/drain behavior and normal scheduling | Representative behavior, no global look-ahead |
+| Parallel drain heuristic | Attempts several maintenance nodes concurrently within disruption limits | Shorter maintenance windows, greater risk of blocked progress |
+| Karpenter-inspired simulation | Checks whether affected Pods fit and whether replacement capacity is needed before disruption | Practical capacity-aware baseline without exact global optimization |
 | First-Fit Decreasing | Greedy vector-bin-packing baseline | Very fast, potentially fragmented placements |
 | OR-Tools CP-SAT | Bounded global constraint optimizer | Strong solution quality, increasing runtime at scale |
 | Local search | Custom improvement heuristic over an initial placement | Adjustable balance between runtime and quality |
 
 Possible later experiments include best-fit variants, tabu search, simulated annealing, and hybrid approaches that warm-start CP-SAT with a greedy or local-search solution.
+
+## Two connected planning problems
+
+DrainLab treats maintenance planning as two connected problems rather than one
+final assignment:
+
+1. **Target placement:** decide where each affected workload should run after
+   the maintenance nodes become unavailable.
+2. **Execution sequencing:** decide when to create replacements, wait for
+   readiness, evict old Pods, and declare each node maintenance-ready.
+
+A target placement can be valid while its execution is unsafe or impossible.
+Conversely, a conservative execution sequence can preserve availability but
+miss the maintenance deadline or consume unnecessary temporary capacity.
+DrainLab will evaluate both outcomes explicitly.
 
 ## Initial constraint model
 
@@ -164,16 +210,40 @@ DrainLab will generate deterministic scenarios from versioned configurations and
 - plan-validation failures;
 - successful realization by the simulated scheduler.
 
+### Availability measurements
+
+PodDisruptionBudget compliance is necessary but is not treated as proof of
+application availability. At each execution step, DrainLab will record:
+
+- desired, available, and Ready replica counts;
+- current PDB disruption allowance;
+- replacement creation and readiness delay;
+- duration below the desired replica count;
+- blocked or retried evictions;
+- temporary and additional capacity in use; and
+- whether the maintenance deadline was met.
+
+Application-level availability and service health remain outside the initial
+simulation model and must not be inferred solely from Pod readiness.
+
 Results will be emitted in a machine-readable format so experiments can be repeated and charts regenerated.
 
 ## Research questions
 
-1. When does global CP-SAT planning materially improve on native drain behavior or greedy bin packing?
-2. How quickly does CP-SAT runtime grow with cluster size, utilization, and affinity density?
-3. Can local search approach CP-SAT solution quality within a much smaller time budget?
-4. How much additional capacity is required to preserve strict disruption budgets during maintenance?
-5. Which constraints most frequently make maintenance plans infeasible?
-6. How does optimizing the movement sequence differ from optimizing only the final placement?
+1. Does jointly optimizing placement and disruption-safe action ordering reduce
+   additional capacity and failed maintenance operations compared with
+   sequential drain and existing heuristics?
+2. When does global CP-SAT planning materially improve on sequential drain,
+   parallel drain, Karpenter-inspired simulation, or greedy bin packing?
+3. How quickly does CP-SAT runtime grow with cluster size, utilization,
+   maintenance-set size, and affinity density?
+4. Can local search approach CP-SAT solution quality within a much smaller time
+   budget?
+5. How much additional capacity is required to preserve strict disruption
+   budgets and readiness requirements during maintenance?
+6. Which constraints most frequently make maintenance plans infeasible?
+7. How often is a feasible final placement paired with an unsafe or
+   deadline-violating execution sequence?
 
 ## Validation strategy
 
@@ -268,12 +338,20 @@ drainlab/
 
 The structure may be simplified during the first milestones; modules should only be split when their boundaries become useful in code.
 
-## Related work
+## Closest systems and related work
 
-- [OPSche: A Kubernetes Scheduler Plugin for Cluster-Wide Placement Optimisation](https://arxiv.org/abs/2608.06987)
+| System | Existing capability | DrainLab's intended distinction |
+| --- | --- | --- |
+| [`kubectl drain`](https://kubernetes.io/docs/tasks/administer-cluster/safely-drain-node/) | Cordons a node and evicts workloads through the Eviction API while respecting PDB responses | Compares advance plans for a set of maintenance nodes and reports feasibility before execution |
+| [Kubernetes Descheduler](https://github.com/kubernetes-sigs/descheduler) | Selects and evicts movable Pods according to policy, then relies on the normal scheduler for replacement placement | Evaluates explicit target placements and ordered maintenance plans rather than best-effort eviction alone |
+| [Karpenter](https://karpenter.sh/docs/concepts/disruption/) | Simulates scheduling, checks disruption budgets, and pre-spins capacity for node disruption and consolidation | Uses a reproducible, provider-neutral benchmark to compare that style of heuristic with greedy, local-search, and exact approaches |
+| [Node Maintenance Operator](https://github.com/medik8s/node-maintenance-operator) | Coordinates node maintenance by cordoning and draining requested nodes | Studies plan quality, infeasibility, ordering, and capacity rather than exposing maintenance as an operational API |
+| [Kubernetes Scheduler Simulator](https://github.com/kubernetes-sigs/kube-scheduler-simulator) | Runs and explains scheduler decisions in a KWOK-backed simulated cluster | Focuses experiments on multi-node maintenance planning and cross-algorithm benchmark results |
+| [OPSche](https://arxiv.org/abs/2608.06987) | Lets external solvers drive cluster-wide placement through Kubernetes Scheduling Framework plugins | Keeps initial execution offline and asks how global placement interacts with disruption-safe maintenance sequencing |
+
+Additional foundations and adjacent research:
+
 - [OPSche reproducibility artifact](https://zenodo.org/records/19052813)
-- [Kubernetes Scheduler Simulator](https://github.com/kubernetes-sigs/kube-scheduler-simulator)
-- [Kubernetes Descheduler](https://github.com/kubernetes-sigs/descheduler)
 - [Kubernetes Scheduler Plugins](https://github.com/kubernetes-sigs/scheduler-plugins)
 - [KWOK](https://github.com/kubernetes-sigs/kwok)
 - [Cost Minimization in Multi-cloud Systems with Runtime Microservice Re-orchestration](https://arxiv.org/abs/2401.01408)
